@@ -75,9 +75,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 100 is the channel capacity (how many messages can be buffered)
     let (tx, _rx) = broadcast::channel::<Message>(100);
 
+    let messages_as_row = client
+        .query(
+            "SELECT id, text, created_at::text FROM chat_public_demo ORDER BY created_at ASC",
+            &[],
+        )
+        .await?;
+    let messages: Vec<Message> = messages_as_row
+        .into_iter()
+        .map(|row| Message {
+            id: row.get(0),
+            text: row.get(1),
+            created_at: row.get(2),
+        })
+        .collect();
+
+    tracing::info!("Loaded {} existing messages", messages.len());
     // Initialize shared state
     let state = AppState {
-        messages: Arc::new(RwLock::new(Vec::new())),
+        messages: Arc::new(RwLock::new(messages)),
         realtime_url: realtime_url.clone(),
         api_key: api_key.clone(),
         db_client: Arc::new(RwLock::new(client)),
