@@ -252,6 +252,30 @@ async fn index_handler(State(state): State<AppState>) -> impl IntoResponse {
         evtSource.onerror = function() {{
             console.error('EventSource failed, reconnecting...');
         }};
+
+        // Handle form submission via JavaScript to avoid page reload
+        const form = document.querySelector('form');
+        const input = document.querySelector('input[name="text"]');
+
+        form.addEventListener('submit', async function(e) {{
+            e.preventDefault();
+
+            const text = input.value.trim();
+            if (!text) return;
+
+            // Submit the form data
+            await fetch('/messages', {{
+                method: 'POST',
+                headers: {{
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                }},
+                body: 'text=' + encodeURIComponent(text)
+            }});
+
+            // Clear the input field
+            input.value = '';
+            input.focus();
+        }});
     </script>
 </body>
 </html>"#,
@@ -279,8 +303,8 @@ async fn submit_message(
         Err(e) => tracing::error!("Failed to insert message: {}", e),
     }
 
-    // Redirect back to home page
-    axum::response::Redirect::to("/")
+    // Return 204 No Content - don't redirect, let SSE update the UI
+    axum::http::StatusCode::NO_CONTENT
 }
 
 // Server-Sent Events handler for live updates
