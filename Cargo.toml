@@ -9,7 +9,7 @@ dotenvy = "0.15.7"
 futures = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-supabase-realtime-rs = "0.1.1"
+supabase-client-rs = { version = "0.1.0", features = ["realtime"] }
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-postgres = { version = "0.7.15", features = ["with-serde_json-1"] }
 tower-http = { version = "0.6.7", features = ["fs", "trace"] }

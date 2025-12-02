@@ -7,8 +7,9 @@ use axum::{
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use supabase_realtime_rs::{
-    PostgresChangeEvent, PostgresChangesFilter, RealtimeClient, RealtimeClientOptions,
+use supabase_client_rs::supabase_realtime_rs::{
+    PostgresChangeEvent, PostgresChangesFilter, PostgresChangesPayload, RealtimeClient,
+    RealtimeClientOptions,
 };
 use tokio::sync::{RwLock, broadcast};
 use tokio_postgres::{Client, NoTls};
@@ -156,20 +157,33 @@ async fn start_realtime_listener(state: AppState) -> Result<(), Box<dyn std::err
     while let Some(payload) = rx.recv().await {
         tracing::info!("Received Postgres change: {:?}", payload);
 
-        // Parse the new message from payload
-        if let Some(data) = payload.get("data") {
-            if let Some(record) = data.get("record") {
-                if let Ok(message) = serde_json::from_value::<Message>(record.clone()) {
-                    tracing::info!("New message: {:?}", message);
+        match payload {
+            PostgresChangesPayload::Insert(insert_payload) => {
+                // Convert HashMap to JSON Value, then deserialize to Message struct
+                let message = match serde_json::to_value(&insert_payload.new) {
+                    Ok(value) => match serde_json::from_value::<Message>(value) {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            tracing::error!("Failed to deserialize message from payload: {}", e);
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!("Failed to convert HashMap to JSON value: {}", e);
+                        continue;
+                    }
+                };
 
-                    // Add to shared state
-                    let mut messages = state.messages.write().await;
-                    messages.push(message.clone());
+                tracing::info!("New message: {:?}", message);
 
-                    // Broadcast to all SSE clients
-                    let _ = state.tx.send(message);
-                }
+                // Add to shared state
+                let mut messages = state.messages.write().await;
+                messages.push(message.clone());
+
+                // Broadcast to all SSE clients
+                let _ = state.tx.send(message);
             }
+            _ => {}
         }
     }
 
