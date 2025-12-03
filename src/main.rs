@@ -7,12 +7,11 @@ use axum::{
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use supabase_client_rs::supabase_realtime_rs::{
-    PostgresChangeEvent, PostgresChangesFilter, PostgresChangesPayload, RealtimeClient,
-    RealtimeClientOptions,
+use supabase_client_rs::{
+    SupabaseClient,
+    supabase_realtime_rs::{PostgresChangeEvent, PostgresChangesFilter, PostgresChangesPayload},
 };
 use tokio::sync::{RwLock, broadcast};
-use tokio_postgres::{Client, NoTls};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -37,9 +36,7 @@ struct MessageForm {
 #[derive(Clone)]
 struct AppState {
     messages: Arc<RwLock<Vec<Message>>>,
-    realtime_url: String,
-    api_key: String,
-    db_client: Arc<RwLock<Client>>,
+    supabase_client: Arc<SupabaseClient>,
     tx: broadcast::Sender<Message>,
 }
 
@@ -56,48 +53,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load environment variables
     dotenvy::dotenv().ok();
-    let realtime_url = std::env::var("SUPABASE_REALTIME_URL")?;
+    let supabase_url = std::env::var("SUPABASE_URL")?;
     let api_key = std::env::var("SUPABASE_API_KEY")?;
-    let database_url = std::env::var("DATABASE_URL")?;
 
-    // Connect to Postgres
-    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
-
-    // Spawn connection handler
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::error!("Database connection error: {}", e);
-        }
-    });
-
-    tracing::info!("Connected to database");
+    // Create Supabase client
+    let supabase_client = SupabaseClient::new(&supabase_url, &api_key)?;
+    tracing::info!("Connected to Supabase");
 
     // Create broadcast channel for real-time message updates
     // 100 is the channel capacity (how many messages can be buffered)
     let (tx, _rx) = broadcast::channel::<Message>(100);
 
-    let messages_as_row = client
-        .query(
-            "SELECT id, text, created_at::text FROM chat_public_demo ORDER BY created_at ASC",
-            &[],
-        )
+    // Load existing messages using PostgREST
+    let response = supabase_client
+        .from("chat_public_demo")
+        .select("id, text, created_at")
+        .order("created_at.asc")
+        .execute()
         .await?;
-    let messages: Vec<Message> = messages_as_row
-        .into_iter()
-        .map(|row| Message {
-            id: row.get(0),
-            text: row.get(1),
-            created_at: row.get(2),
-        })
-        .collect();
+
+    let messages: Vec<Message> = if response.status().is_success() {
+        let body = response.text().await?;
+        serde_json::from_str(&body)?
+    } else {
+        tracing::warn!("Failed to load messages: {}", response.status());
+        Vec::new()
+    };
 
     tracing::info!("Loaded {} existing messages", messages.len());
+
     // Initialize shared state
     let state = AppState {
         messages: Arc::new(RwLock::new(messages)),
-        realtime_url: realtime_url.clone(),
-        api_key: api_key.clone(),
-        db_client: Arc::new(RwLock::new(client)),
+        supabase_client: Arc::new(supabase_client),
         tx,
     };
 
@@ -130,18 +118,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn start_realtime_listener(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting Realtime listener...");
 
+    // Get the realtime client from SupabaseClient
+    let realtime = state.supabase_client.realtime();
+
     // Connect to Supabase Realtime
-    let client = RealtimeClient::new(
-        &state.realtime_url,
-        RealtimeClientOptions {
-            api_key: state.api_key.clone(),
-            ..Default::default()
-        },
-    )?;
-    client.connect().await?;
+    realtime.connect().await?;
 
     // Subscribe to chat_public_demo table changes
-    let channel = client.channel("chat-changes", Default::default()).await;
+    let channel = realtime.channel("chat-changes", Default::default()).await;
 
     let mut rx = channel
         .on_postgres_changes(
@@ -320,17 +304,27 @@ async fn submit_message(
 ) -> impl IntoResponse {
     tracing::info!("Received message: {}", form.text);
 
-    // Insert message into Postgres
-    let client = state.db_client.read().await;
-    match client
-        .execute(
-            "INSERT INTO chat_public_demo (text) VALUES ($1)",
-            &[&form.text],
-        )
+    // Insert message into Postgres using PostgREST
+    let insert_data = serde_json::json!({
+        "text": form.text
+    });
+
+    match state
+        .supabase_client
+        .from("chat_public_demo")
+        .insert(insert_data.to_string())
+        .execute()
         .await
     {
-        Ok(_) => tracing::info!("Message inserted successfully"),
-        Err(e) => tracing::error!("Failed to insert message: {}", e),
+        Ok(response) if response.status().is_success() => {
+            tracing::info!("Message inserted successfully");
+        }
+        Ok(response) => {
+            tracing::error!("Failed to insert message: {}", response.status());
+        }
+        Err(e) => {
+            tracing::error!("Failed to insert message: {}", e);
+        }
     }
 
     // Return 204 No Content - don't redirect, let SSE update the UI
